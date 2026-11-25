@@ -130,6 +130,7 @@ jobs:
         done
         python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$P/Library/Extensions/PhxAccel.kext/Contents/Info.plist"
         grep -q 0x15c81002 "$P/Library/Extensions/PhxAccel.kext/Contents/Info.plist" || { echo "::error::PhxAccel lacks 15C8"; exit 1; }
+        grep -q 0x19011002 "$P/Library/Extensions/PhxAccel.kext/Contents/Info.plist" || { echo "::error::PhxAccel lacks 1901 (Hawk Point 2 740M)"; exit 1; }
 
     - uses: actions/upload-artifact@v4
       if: steps.gate.outputs.skip != '1'
