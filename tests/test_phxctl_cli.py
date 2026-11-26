@@ -89,6 +89,36 @@ static inline int fake_usleep(unsigned us) { (void)us; return 0; }
 '''
 
 
+# RadeArc's mesboot reads the chip and carve-out from PhxBringup's registry properties: the fake registry reports a
+# Phoenix (780M), whose layout is the fixed one these tests exercise.
+COREFOUNDATION = r'''
+#ifndef FAKE_CF_H
+#define FAKE_CF_H
+#include <string.h>
+typedef struct FakeCF { int type; const char *s; } FakeCF;
+typedef const FakeCF *CFTypeRef, *CFStringRef, *CFNumberRef;
+typedef unsigned long CFTypeID;
+#define kCFAllocatorDefault 0
+#define kCFStringEncodingUTF8 0
+#define kCFNumberSInt64Type 4
+static FakeCF fake_cf_str[8]; static unsigned fake_cf_n;
+static inline CFStringRef fake_cf_make(const char *s) { FakeCF *f = &fake_cf_str[fake_cf_n++ % 8]; f->type = 1; f->s = s; return f; }
+#define CFSTR(x) fake_cf_make(x)
+static inline CFStringRef CFStringCreateWithCString(int a, const char *s, int e) { (void)a; (void)e; return fake_cf_make(s); }
+static inline void CFRelease(CFTypeRef p) { (void)p; }
+static inline CFTypeID CFGetTypeID(CFTypeRef p) { return (CFTypeID)p->type; }
+static inline CFTypeID CFStringGetTypeID(void) { return 1; }
+static inline CFTypeID CFNumberGetTypeID(void) { return 2; }
+static inline int CFNumberGetValue(CFNumberRef n, int t, void *v) { (void)n; (void)t; (void)v; return 0; }
+static inline int CFStringGetCString(CFStringRef s, char *b, long n, int e) { (void)e; strncpy(b, s->s, (size_t)n - 1); b[n - 1] = 0; return 1; }
+static inline CFTypeRef IORegistryEntryCreateCFProperty(unsigned e, CFStringRef k, int a, unsigned o) {
+    (void)e; (void)a; (void)o;
+    return strcmp(k->s, "phx-chip") ? (CFTypeRef)0 : fake_cf_make("Phoenix");
+}
+#endif
+'''
+
+
 class TransportCLI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -98,6 +128,8 @@ class TransportCLI(unittest.TestCase):
         headers = cls.base / 'IOKit'
         headers.mkdir()
         (headers / 'IOKitLib.h').write_text(IOKIT)
+        (cls.base / 'CoreFoundation').mkdir()
+        (cls.base / 'CoreFoundation' / 'CoreFoundation.h').write_text(COREFOUNDATION)
         compiler = shutil.which('clang') or shutil.which('cc')
         if not compiler:
             raise RuntimeError('C compiler required for CLI regression tests')
