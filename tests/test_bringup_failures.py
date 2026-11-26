@@ -22,7 +22,14 @@ elif name=='ioreg':
         print('class '+ ('PhxAMDFB' if 'PhxAMDFB' in args else 'NMXAccel' if 'NMXAccel' in args else 'IOFramebuffer'))
     else: print('class IONDRVFramebuffer')
     print('\"phx-build\" = 34')
-elif name=='phxctl': print('loadfw result' if args[0]=='loadfw' else 'ok')
+elif name=='phxctl':
+    # phxctl prints the IOKit result as "kr"; RadeArc's bringup5.sh checks it (a refused PSP ring: 0xe00002c7)
+    bad=command==os.environ.get('BOOT_FAIL') or (args[0]=='loadfw' and os.environ.get('BOOT_FAIL')=='loadfw')
+    print(('loadfw result' if args[0]=='loadfw' else 'ok')+' kr '+('0xe00002c7' if bad else '0x00000000')+'  status 0x00000000')
+elif name=='phxfw':   # RadeArc: the firmware plan bringup5.sh loads (one TOC, one engine)
+    print('CHIP phoenix gc_11_0_1 psp_13_0_4 sdma_6_0_1')
+    print('TOC /fw/psp_13_0_4_toc.bin 256 2304')
+    print('L /fw/gc_11_0_1_pfp.bin 256 263168 2 0x000000')
 elif name=='mesboot': print('compute: ready')
 if command==os.environ.get('BOOT_FAIL') or (name=='phxctl' and args[0]=='loadfw' and os.environ.get('BOOT_FAIL')=='loadfw'): sys.exit(7)
 if name=='kill': sys.exit(int(os.environ.get('KILL_STATUS','0')))
@@ -42,7 +49,7 @@ class BringupFailureTest(unittest.TestCase):
             fake.chmod(0o755)
             for command in ('id','sleep','shutdown','kill','sysctl','sync','nvram','ioreg'):
                 (commands / command).symlink_to(fake)
-            for command in ('phxctl','mesboot'):
+            for command in ('phxctl','mesboot','phxfw'):
                 (gpu / 'phxctl' / command).symlink_to(fake)
             for script in ('bringup5.sh','full.sh'):
                 text = (ROOT / 'tools/phxctl' / script).read_text().replace('~/gpu',str(gpu)).replace('/bin/kill',str(commands/'kill'))
@@ -65,19 +72,19 @@ class BringupFailureTest(unittest.TestCase):
             events = [json.loads(s) for s in (base/'events').read_text().splitlines()]
             return result.returncode, events, (base/'reached').exists()
 
+    # RadeArc: a refused PSP ring or firmware load stops bringup5.sh before anything else is sent and cancels its own
+    # watchdog (PhxBringup refuses Phoenix 2 without -phxp2; that must not reboot the Mac). SMU replies are logged only.
     def test_create_failure_aborts_before_firmware(self):
         rc, events, _ = self.run_script('bringup5.sh', 'phxctl psp create')
-        self.assertEqual(rc,7)
+        self.assertNotEqual(rc,0)
         self.assertFalse(any(e[0]=='phxctl' and e[1][0]=='stage' for e in events))
-        self.assertFalse(any(e[0]=='kill' for e in events))
+        self.assertEqual(sum(e[0]=='kill' for e in events),1)
 
-    def test_firmware_and_smu_failures_survive_output_pipelines(self):
-        for fail in ('phxctl loadfw', 'phxctl smu 0x3'):
-            with self.subTest(fail=fail):
-                target = 'loadfw' if fail=='phxctl loadfw' else fail
-                rc, events, _ = self.run_script('bringup5.sh', target)
-                self.assertEqual(rc,7)
-                self.assertFalse(any(e[0]=='kill' for e in events))
+    def test_firmware_failure_stops_bringup(self):
+        rc, events, _ = self.run_script('bringup5.sh', 'loadfw')
+        self.assertNotEqual(rc,0)
+        self.assertFalse(any(e[0]=='phxctl' and e[1][0]=='autoload' for e in events))
+        self.assertEqual(sum(e[0]=='kill' for e in events),1)
 
     def test_best_effort_destroy_does_not_abort(self):
         rc, _, _ = self.run_script('bringup5.sh','phxctl psp destroy')
@@ -89,7 +96,7 @@ class BringupFailureTest(unittest.TestCase):
 
     def test_full_does_not_continue_after_failed_powerup(self):
         rc, events, _ = self.run_script('full.sh','phxctl psp create')
-        self.assertEqual(rc,7)
+        self.assertNotEqual(rc,0)
         self.assertFalse(any(e[0]=='mesboot' for e in events))
 
     def test_full_keeps_watchdog_after_failed_mes_step(self):

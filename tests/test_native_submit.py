@@ -79,6 +79,7 @@ struct IOAccelPhxNativeClient {
     PhxPendingFences pendingFences;
     IOAccelPhxNativeClient(){ctx[1]=true;}
     Bo *findBo(unsigned h){return h==1 ? &bo : nullptr;}
+    uint8_t *kernelView(Bo &b){return b.kva;}
     bool ibCovered(uint64_t,uint64_t){return true;}
     bool ensureVmid(){return true;}
     void flushBos(){}
