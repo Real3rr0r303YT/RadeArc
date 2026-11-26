@@ -43,13 +43,17 @@ static int nvmtl_gsub_finish(NVMTLSubmissionPart *part) {
 // Queue keys and command-buffer references are weak. An abandoned recording is
 // never registered; completion removes committed entries without retaining VRAM.
 static NSMapTable *nvmtl_surface_writers;
-static NSString *nvmtl_surface_writer_key(NVMTLTexture *t) {
-    return [NSString stringWithFormat:@"%u:%lu", (unsigned)IOSurfaceGetID(t->_surf), (unsigned long)t->_plane];
+static inline id<NSCopying> nvmtl_surface_plane_key(uint32_t sid, NSUInteger plane) {
+    if (plane < 256) return @(((uint64_t)sid << 8) | plane);
+    return [NSString stringWithFormat:@"%u:%lu", sid, (unsigned long)plane];
+}
+static inline id<NSCopying> nvmtl_surface_writer_key(NVMTLTexture *t) {
+    return nvmtl_surface_plane_key((uint32_t)IOSurfaceGetID(t->_surf), t->_plane);
 }
 static BOOL nvmtl_surface_pending_write(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
     if (!cb || !t || !t->_surf) return NO;
     @synchronized ([NVMTLCommandBuffer class]) {
-        NSString *key = nvmtl_surface_writer_key(t);
+        id<NSCopying> key = nvmtl_surface_writer_key(t);
         for (id queue in nvmtl_surface_writers.keyEnumerator) {
             NSDictionary *writes = [nvmtl_surface_writers objectForKey:queue];
             NVMTLPendingSurfaceWrite *write = writes[key];
@@ -260,7 +264,7 @@ static void nvmtl_surface_finish_writes(NVMTLCommandBuffer *cb) {
     nvmtl_ws_mark_ready(cb);
     @synchronized ([NVMTLCommandBuffer class]) {
         NSMutableDictionary *writes = [nvmtl_surface_writers objectForKey:cb->_queue];
-        for (NSString *key in [writes.allKeys copy]) {
+        for (id key in [writes.allKeys copy]) {
             NVMTLPendingSurfaceWrite *write = writes[key];
             if (!write->buffer || write->buffer == cb) [writes removeObjectForKey:key];
         }
@@ -417,6 +421,20 @@ static int nvmtl_skip_empty_on(void) {
         _gpuTiming.host_after_ns = commands->timing.host_after_ns;
     }
 }
+// NVMTL_WS_GPUTIME=1 (WindowServer only): where a command buffer's time goes, averaged over 2000 at a time: from its
+// submission to the GPU starting it, the GPU running it, and from the GPU finishing to the plugin seeing that.
+static void nvmtl_ws_gputime(double submitted, double start, double end, double seen)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_WS_GPUTIME"); on = e && e[0] == '1' && getprogname() && !strcmp(getprogname(), "WindowServer"); }
+    if (!on || !submitted || !start || end < start) return;
+    static double q, run, done, runMax; static unsigned n;
+    q += start - submitted; run += end - start; done += seen - end; if (end - start > runMax) runMax = end - start;
+    if (++n < 2000) return;
+    nvlog("WS GPU time over %u command buffers: queued %.0f us, running %.0f us (max %.0f), finished-to-seen %.0f us",
+          n, q / n * 1e6, run / n * 1e6, runMax * 1e6, done / n * 1e6);
+    q = run = done = runMax = 0; n = 0;
+}
 - (void)nvmtlFinishExecution:(NSError *)error {
     if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
     for (NSUInteger i = _nextPart; i < _parts.count; i++) {
@@ -441,6 +459,7 @@ static int nvmtl_skip_empty_on(void) {
     [_completionCondition lock];
     _gpuStart = deviceStart; _gpuEnd = deviceEnd;
     _legacyKernelEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
+    nvmtl_ws_gputime(_legacyKernelStart, deviceStart, deviceEnd, _legacyKernelEnd);
     _cbError = error; _cbstatus = error ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted;
     _executionDone = YES;
     [_completionCondition unlock];
@@ -552,7 +571,7 @@ static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
             continue;
         }
         if (!part->commands.cb) return NO;
-        if (!part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
+        if (!part->commands.encoding_error && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
             if (!nvmtl_evfold_on() || _nextSubmit + 1 >= _parts.count) return NO;
             [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
@@ -626,7 +645,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         uint64_t have = ((uint64_t(*)(id,SEL))objc_msgSend)(part->waitEvent,@selector(signaledValue));
         if (have < part->value) { @synchronized ([NVMTLCommandBuffer class]) { part->claimed = NO; } return NO; }
     }
-    if (!ahead && part->commands.cb && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
+    if (!ahead && part->commands.cb && !part->commands.encoding_error && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
         [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
         nvmtl_vk_cmd_abandon(&part->commands);

@@ -13,6 +13,9 @@ ALLOW=/Library/GPUBundles/nvmtl-allow.txt; DR=/Library/Logs/DiagnosticReports
 exec >>"$LOG" 2>&1
 echo "== $(date '+%F %T') phxboot"
 release() { sysctl -w debug.phxfb_hold=0 >/dev/null 2>&1; }
+# NVRAM changes reach flash on a clean shutdown only, unless forced: the arming written after a good boot was lost when
+# the battery ran out overnight, and the next boot left WindowServer on the firmware framebuffer (2026-10-22)
+nv_commit() { nvram IONVRAM-FORCESYNCNOW-PROPERTY=phxfb >/dev/null 2>&1; }
 apps_only() { printf '# phxboot: Metal for the built-in test tools only\n' > $ALLOW; }
 # every process gets the Metal device; WindowServer too once the accelerator is armed (NullMoth's own default list).
 # Denied ("-name", before "*"): the background neural-network users. mediaanalysisd (Photos analysis, which starts by
@@ -28,7 +31,11 @@ all_apps() { { printf '# phxboot: Metal for every app%s\n' "$1"; for d in $DENY;
 m2_fail() {
     echo "M2 failed ($1): PhxAMDFB off, rebooting"
     apps_only; sysctl -w debug.phxagdc=0 >/dev/null 2>&1
-    nvram -d phxfb-boot; rm -f "$MARK" $G/phxboot-m2; sync; shutdown -r now; exit 0
+    nvram -d phxfb-boot; nv_commit; rm -f "$MARK" $G/phxboot-m2; sync; shutdown -r now; exit 0
+}
+gpu_fail() {
+    [ "$M2" = 1 ] && m2_fail "$1"
+    echo "$1"; release; rm -f "$MARK"; exit 1
 }
 # PhxAMDFB comes from the Aux KC, which loads well after PhxBringup: wait for the panel's framebuffer (PhxAMDFB, or
 # IONDRV when PhxAMDFB was not armed) before telling which one took it
@@ -39,7 +46,7 @@ esac
 if [ -e "$OFF" ]; then echo "kill switch present: nothing to do"; release; exit 0; fi
 if [ -e "$MARK" ]; then
     echo "previous attempt did not finish: phxboot and PhxAMDFB off"
-    touch "$OFF"; rm -f "$MARK"; nvram -d phxfb-boot; sync
+    touch "$OFF"; rm -f "$MARK"; nvram -d phxfb-boot; nv_commit; sync
     wait_fb; ioreg -rc PhxAMDFB -d0 | grep -q PhxAMDFB && { echo "PhxAMDFB took the panel: rebooting"; shutdown -r now; }
     release; exit 0
 fi
@@ -50,24 +57,19 @@ ioreg -l | grep -q '"phx-build"' || { [ $M2 = 1 ] && m2_fail "PhxBringup not loa
 echo "PhxAMDFB on the panel: $M2"
 touch "$MARK"; sync
 apps_only
-MC=1 CS=1 ADOPT=1 GFX=1 AG=1 bash $G/full.sh kiqsched | grep -E "^compute:|^gfx:|adopt|failed"
-if [ "${PIPESTATUS[0]}" != 0 ]; then   # no firmware plan, or bring-up stopped: do not claim the GPU
-    [ $M2 = 1 ] && m2_fail "GPU bring-up failed"
-    echo "GPU bring-up failed: the firmware framebuffer stays"; release; rm -f "$MARK"; exit 0
-fi
-$G/phxctl/mesboot claim
+(set -o pipefail; MC=1 CS=1 ADOPT=1 GFX=1 AG=1 bash $G/full.sh kiqsched | grep -E "^compute:|^gfx:|adopt|failed") || gpu_fail "GPU bring-up failed"
+$G/phxctl/mesboot claim || gpu_fail "accelerator claim failed"
 # no BO cache flushing per submit/wait (the GPU maps system memory snooped): 41 fps window drag instead of 13, and no
 # artifacts seen (2026-10-20)
 sysctl -w debug.phxbos_flush=0 >/dev/null 2>&1
 for i in $(seq 1 20); do ioreg -rc NMXAccel -d0 | grep -q NMXAccel && break; sleep 1; done
 if ! ioreg -rc NMXAccel -d0 | grep -q NMXAccel; then
-    [ $M2 = 1 ] && m2_fail "NMXAccel did not start"
-    echo "NMXAccel did not start"; release; rm -f "$MARK"; exit 0
+    gpu_fail "NMXAccel did not start"
 fi
 if [ $M2 = 1 ]; then
-    sysctl -w debug.nvaccelfb=1 >/dev/null; sleep 1
-    sysctl -w debug.nvaccel_iop=1 >/dev/null; sysctl -w debug.nvaccelfb=3 >/dev/null; sleep 1
-    sysctl -w debug.phxagdc=1 >/dev/null; sleep 1
+    sysctl -w debug.nvaccelfb=1 >/dev/null || m2_fail "framebuffer preparation failed"; sleep 1
+    sysctl -w debug.nvaccel_iop=1 >/dev/null || m2_fail "scanout preparation failed"; sysctl -w debug.nvaccelfb=3 >/dev/null || m2_fail "framebuffer arming failed"; sleep 1
+    sysctl -w debug.phxagdc=1 >/dev/null || m2_fail "AGDC arming failed"; sleep 1
     # frames copied with SSE streaming loads (XMM saved around them): 1.0 ms a frame against 2.1 (2026-10-20)
     sysctl -w debug.nvaccel_iop_sse=1 >/dev/null
     # a copied frame completes on the next VBL tick, as a flip latches: fewer frames presented twice within one refresh
@@ -93,7 +95,7 @@ else
     release
     all_apps " (WindowServer stays on the firmware framebuffer)" ""
 fi
-[ -e $G/phxboot-m2 ] && nvram phxfb-boot=1 && echo "PhxAMDFB armed for the next boot"
+[ -e $G/phxboot-m2 ] && nvram phxfb-boot=1 && { nv_commit; echo "PhxAMDFB armed for the next boot"; }
 rm -f "$MARK"; sync
 echo "done $(date '+%T')"
 
@@ -101,21 +103,26 @@ echo "done $(date '+%T')"
 # same way: the session is logged out and the screen stays black. There is no GPU reset yet, so two WindowServer
 # reports within 5 minutes reboot the Mac; three such reboots within an hour take WindowServer off the GPU.
 watch_hangs() {
-    local base n now first=0
-    base=$(ls $DR | grep -c '^WindowServer-.*\.ips$')
+    local base n now added previous=0
+    base=$(ls "$DR" | grep -Ec '^WindowServer[-_].*\.(ips|spin)$')
     while sleep 15; do
-        n=$(ls $DR | grep -c '^WindowServer-.*\.ips$'); [ $n -gt $base ] || continue
-        now=$(date +%s); [ $first = 0 ] && first=$now
-        if [ $((n - base)) -ge 2 ]; then
-            echo "$(date '+%F %T') WindowServer hung $((n - base)) times on the GPU: rebooting"
+        n=$(ls "$DR" | grep -Ec '^WindowServer[-_].*\.(ips|spin)$')
+        if [ "$n" -lt "$base" ]; then
+            base=$n; previous=0; continue
+        fi
+        added=$((n - base)); base=$n
+        [ "$added" -gt 0 ] || continue
+        now=$(date +%s)
+        if [ "$added" -ge 2 ] || { [ "$previous" -gt 0 ] && [ "$now" -ge "$previous" ] && [ $((now - previous)) -le 300 ]; }; then
+            echo "$(date '+%F %T') WindowServer hung twice within 5 minutes on the GPU: rebooting"
             echo $now >> $G/hang-reboots
             if [ $(awk -v t=$((now - 3600)) '$1 > t' $G/hang-reboots | wc -l) -ge 3 ]; then
                 echo "3 GPU hangs within an hour: WindowServer goes back to the firmware framebuffer"
-                rm -f $G/phxboot-m2; nvram -d phxfb-boot
+                rm -f $G/phxboot-m2; nvram -d phxfb-boot; nv_commit
             fi
             sync; ${PHX_REBOOT:-shutdown -r now}; return
         fi
-        [ $((now - first)) -gt 300 ] && { base=$n; first=0; }
+        previous=$now
     done
 }
 [ $M2 = 1 ] && watch_hangs

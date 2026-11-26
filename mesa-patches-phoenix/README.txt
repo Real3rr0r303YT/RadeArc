@@ -26,3 +26,27 @@ Check (no GPU, in-process mock kext):
 0008  radv/darwin: 16384 BO handles. Matches PhxBringup build 38 (PHXN_MAX_BOS 16384). WindowServer ran out of the
       4095 handles: MTLTexture allocations failed down to 64x64, the desktop flickered, WindowServer crashed.
       Install it together with build 38: an older Mesa refuses handles above 4095.
+
+RadeArc: upstream nullarc's own 0007 (captured Phoenix topology) lives in upstream/ and is NOT applied by CI:
+     it edits the same ac_darwin_drm.c/.h and ac_darwin_mock.c hunks as RadeArc's 0007 (Phoenix 2 canned table)
+     and would not apply on top of it. PhxBringup's topology selector 30 is additive; this Mesa does not query it.
+     The upstream notes below describe that patch.
+
+upstream/0007 adds NullArc topology selector 30 and an explicit HP mock profile. DEV_INFO's
+     physical CU masks, active counts, shader-array dimensions and enabled RB mask
+     come from the captured kernel profile; PCI identity follows the same data.
+     Legacy kexts keep their existing fallback. Captured-only HP native use fails.
+     No GB_ADDR_CONFIG, memory layout or firmware values are inferred from topology.
+
+Alternative to applying 0007 (do not do both):
+  python3 /path/to/nullarc-760m/tools/mesa_phoenix_topology.py /path/to/mesa
+This generator verifies all source anchors before writing. Regenerate it and the
+patch together when changing the wire header/profile. Check the shared HP header:
+  python3 tools/phx_profile.py --check
+
+Host transport tests (from the NullArc checkout):
+  sh tools/test_mesa_topology.sh /path/to/mesa
+Mock Vulkan properties plus gfx1103 ACO pipeline compilation (macOS, x86_64):
+  python3 tools/test_mesa_vulkan_profile.py /path/to/mesa --glslang /path/to/glslangValidator
+The latter explicitly checks 8-CU HP and the unchanged 12-CU legacy default, with
+zero command submissions. It is not hardware execution or Metal testing.

@@ -76,7 +76,7 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *occlusion_pages; uint32_t occlusion_count;
                  void *timing_pool; nvmtl_gpu_interval timing;
                  void *pt_pool; unsigned pt_n, pt_open; uint32_t pt_w[128], pt_h[128], pt_f[128]; uint32_t pt_fs[128][4];
-                 void *counter_recording; unsigned counter_error;
+                 void *counter_recording; unsigned encoding_error;
                  nvmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
                  unsigned restart_off;  /* GL turned primitive restart off (setPrimitiveRestartEnabled:NO) */
@@ -212,6 +212,7 @@ void nvmtl_vk_pre_hold(void *retained);
 extern void (*nvmtl_pre_release_hook)(void *);
 extern void (*nvmtl_pre_submit_hook)(void);
 int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
+int  nvmtl_vk_image_host_xfer(nvk_queue *q, nvk_image *img, nvk_buffer *hb, size_t offset, size_t row_bytes, int to_image);
 int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
 int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
 int  nvmtl_vk_image_create_mips(uint32_t w, uint32_t h, int bgra, uint32_t mips, nvk_image *out);

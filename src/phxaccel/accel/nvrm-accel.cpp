@@ -52,11 +52,15 @@ static void               nvAccelWriteStamp(int index, unsigned int value);
 extern "C" {   // kern/thread_call.h and kern/clock.h clash with the family headers here, so the KPIs are declared by hand
 struct thread_call *thread_call_allocate(void (*func)(void *, void *), void *param0);
 int thread_call_enter_delayed(struct thread_call *call, uint64_t deadline);
+boolean_t thread_call_cancel(struct thread_call *call);
+boolean_t thread_call_free(struct thread_call *call);
 void clock_interval_to_deadline(uint32_t interval, uint32_t scale_factor, uint64_t *result);
 uint64_t mach_absolute_time(void);
 void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 void proc_selfname(char *buf, int size);
 }
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
 static volatile SInt64 gCntVmAlloc, gCntVmAllocBytes, gCntVmDealloc, gCntVmDeallocBytes, gCntVmRefused,
                        gCntResNew, gCntResFree, gCntMapCommit, gCntMapRelease, gCntMapFree;
 static void nvaccelInstallSysctl(void);
@@ -334,6 +338,17 @@ public:
     // mode change. Boot-arg -nvaccelnoheadless keeps the old behaviour.
     static constexpr uint32_t kHeadlessDeadlineSec = 60;   // chosen: NVRMFB heads publish within ~20 s of start (#76 log)
     struct thread_call *fHeadlessCall = nullptr;
+    struct thread_call *fFanCall = nullptr;
+    static void fanWorker(void *p0, void *p1);
+    void armFanWorker() {
+        fFanCall = thread_call_allocate(&NVAccel::fanWorker, this);
+        if (fFanCall) {
+            uint64_t when = 0;
+            clock_interval_to_deadline(500, kMillisecondScale, &when);
+            thread_call_enter_delayed(fFanCall, when);
+            IOLog("PhxAccel: Firebat acoustic fan regulator armed\n");
+        }
+    }
     void armHeadlessCheck() {
         int off = 0;
         if (PE_parse_boot_argn("-nvaccelnoheadless", &off, sizeof off)) { ALOG("headless check: off (-nvaccelnoheadless)"); return; }
@@ -674,6 +689,13 @@ public:
             setProperty("NVAccelSurfaceWait", 1ULL, 32);
             registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
+            if (vm_offset_t va = ml_io_map(0xFE0B0400, 0x100)) {
+                volatile uint8_t *ec = (volatile uint8_t *)va;
+                ec[0x04] = 0x01; // OSFG = 1 (OS handshake alive)
+                ec[0x18] = 0x00; // FFFG = 0 (kill 100% full fan boost if active)
+                ec[0x32] = 0x82; // FCMI = 0x82 (Quiet Mode)
+                IOLog("PhxAccel: Firebat EC init: OSFG=1, FFFG=0, FCMI=0x82, FCMO=0x%02x\n", ec[0x31]);
+            }
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
                 IOAccelNVRMCarrier *c = OSTypeAlloc(IOAccelNVRMCarrier);
                 if (!c) break;
@@ -727,12 +749,21 @@ public:
                     ALOG("MetalPluginName withheld -- nothing will load the Metal plugin until "
                          "`sysctl -w debug.nvaccelfb=1` puts it back, and a reboot takes it away again");
                     armHeadlessCheck();
+                    armFanWorker();
                 }
             } else ALOG("serviceMatching(NVRMFramebuffer) returned NULL -- cannot watch for the framebuffer");
         }
         return r;
     }
-    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE { ALOG("stop"); IOGraphicsAccelerator2::stop(provider); }
+    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
+        if (fFanCall) {
+            thread_call_cancel(fFanCall);
+            while (!thread_call_free(fFanCall)) { thread_call_cancel(fFanCall); IOSleep(5); }
+            fFanCall = nullptr;
+        }
+        ALOG("stop");
+        IOGraphicsAccelerator2::stop(provider);
+    }
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(NVAccel, IOGraphicsAccelerator2)
@@ -1039,18 +1070,30 @@ static int gIopSse = 0;   // debug.nvaccel_iop_sse
 // used here are saved first and put back after (WindowServer hung four times in a row while the first version, without
 // this, was on; not proven to be the cause).
 // bytes: a non-zero multiple of 64; src and dst 16-byte aligned. l10r narrows ARGB2101010 to XRGB8888 on the way.
+static inline void nvIopSSEBegin(uint8_t *save)
+{
+    __asm__ __volatile__(
+        "movdqa %%xmm0, 0(%0)\n\t" "movdqa %%xmm1, 16(%0)\n\t" "movdqa %%xmm2, 32(%0)\n\t" "movdqa %%xmm3, 48(%0)\n\t"
+        "movdqa %%xmm4, 64(%0)\n\t" "movdqa %%xmm5, 80(%0)\n\t" "movdqa %%xmm6, 96(%0)\n\t" "movdqa %%xmm7, 112(%0)\n\t"
+        "movdqa %%xmm8, 128(%0)\n\t" "movdqa %%xmm9, 144(%0)\n\t"
+        : : "r"(save) : "memory");
+}
+
+static inline void nvIopSSEEnd(const uint8_t *save)
+{
+    __asm__ __volatile__(
+        "movdqa 0(%0), %%xmm0\n\t" "movdqa 16(%0), %%xmm1\n\t" "movdqa 32(%0), %%xmm2\n\t" "movdqa 48(%0), %%xmm3\n\t"
+        "movdqa 64(%0), %%xmm4\n\t" "movdqa 80(%0), %%xmm5\n\t" "movdqa 96(%0), %%xmm6\n\t" "movdqa 112(%0), %%xmm7\n\t"
+        "movdqa 128(%0), %%xmm8\n\t" "movdqa 144(%0), %%xmm9\n\t"
+        : : "r"(save) : "memory");
+}
+
 static void nvIopRowSSE(const void *src, void *dst, unsigned long bytes, bool l10r)
 {
     static const uint32_t kMask[16] __attribute__((aligned(16))) = {
         0x00ff0000u, 0x00ff0000u, 0x00ff0000u, 0x00ff0000u, 0x0000ff00u, 0x0000ff00u, 0x0000ff00u, 0x0000ff00u,
         0x000000ffu, 0x000000ffu, 0x000000ffu, 0x000000ffu, 0xff000000u, 0xff000000u, 0xff000000u, 0xff000000u,
     };
-    uint8_t save[160] __attribute__((aligned(16)));
-    __asm__ __volatile__(
-        "movdqa %%xmm0, 0(%0)\n\t" "movdqa %%xmm1, 16(%0)\n\t" "movdqa %%xmm2, 32(%0)\n\t" "movdqa %%xmm3, 48(%0)\n\t"
-        "movdqa %%xmm4, 64(%0)\n\t" "movdqa %%xmm5, 80(%0)\n\t" "movdqa %%xmm6, 96(%0)\n\t" "movdqa %%xmm7, 112(%0)\n\t"
-        "movdqa %%xmm8, 128(%0)\n\t" "movdqa %%xmm9, 144(%0)\n\t"
-        : : "r"(save) : "memory");
     if (l10r) {
 #define NV_L10R_LANE(r) \
         "movdqa %%" r ", %%xmm8\n\t" "movdqa %%" r ", %%xmm9\n\t" \
@@ -1078,11 +1121,6 @@ static void nvIopRowSSE(const void *src, void *dst, unsigned long bytes, bool l1
             :
             : "memory", "cc");
     }
-    __asm__ __volatile__(
-        "movdqa 0(%0), %%xmm0\n\t" "movdqa 16(%0), %%xmm1\n\t" "movdqa 32(%0), %%xmm2\n\t" "movdqa 48(%0), %%xmm3\n\t"
-        "movdqa 64(%0), %%xmm4\n\t" "movdqa 80(%0), %%xmm5\n\t" "movdqa 96(%0), %%xmm6\n\t" "movdqa 112(%0), %%xmm7\n\t"
-        "movdqa 128(%0), %%xmm8\n\t" "movdqa 144(%0), %%xmm9\n\t"
-        : : "r"(save) : "memory");
 }
 // A copied frame completes on the VBL tick after it was copied, as a flip latches at the next vblank. Completed at once,
 // WindowServer presented twice within one refresh whenever an app's update came between its own ticks, then skipped the
@@ -1090,7 +1128,7 @@ static void nvIopRowSSE(const void *src, void *dst, unsigned long bytes, bool l1
 // accelerator re-checks on each VBL interrupt while a transaction is pending; past two refreshes the frame completes
 // regardless (debug.nvaccel_iop_vsync, 0 = complete at once).
 extern volatile uint64_t gPhxVblSeq;
-static int gIopVsync = 0;   // phxboot turns it on once the panel is armed
+static int gIopVsync = 1;   // phxboot turns it on once the panel is armed
 static SInt64 gCntIopVsyncWaits, gCntIopVsyncLate;
 bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
@@ -1278,6 +1316,11 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     const bool damaged = nvIopCopyDamage(head, src, spr, d, dpr, words, h, l10r) >= 0;
     const bool wide = ((((uintptr_t)src | (uintptr_t)d) & 7) == 0) && !(spr & 1) && !(dpr & 1);
     const bool sse = gIopSse && ((((uintptr_t)src | (uintptr_t)d) & 15) == 0) && !(spr & 3) && !(dpr & 3);
+    // XMM registers saved once around the whole frame (upstream 08c5386); the damage-only copy uses no SSE, so nothing
+    // to save when it ran
+    const bool sseCopy = sse && !damaged;
+    uint8_t xmmSave[160] __attribute__((aligned(16)));
+    if (sseCopy) nvIopSSEBegin(xmmSave);
     for (unsigned y = 0; !damaged && y < h; y++) {
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
@@ -1308,6 +1351,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
             __asm__ __volatile__("movnti %1, %0" : "=m"(dw[x]) : "r"(px));
         }
     }
+    if (sseCopy) nvIopSSEEnd(xmmSave);
     __asm__ __volatile__("sfence" ::: "memory");   // the frame is in DRAM before the transaction completes
     fIopVblSeq = __atomic_load_n(&gPhxVblSeq, __ATOMIC_ACQUIRE);
     {
@@ -1373,6 +1417,97 @@ static int nvaccelfb_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_debug, OID_AUTO, nvaccelfb, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
             NULL, 0, nvaccelfb_sysctl, "I",
             "register the NVIDIA framebuffer with the accelerator display machine (1 = found_framebuffer, 2 = family sweep)");
+
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+static int gFirebatFanMode = 2; // Default to Quiet (2)
+
+void NVAccel::fanWorker(void *p0, void *p1)
+{
+    NVAccel *me = (NVAccel *)p0;
+    if (!me || me != gAccel) return;
+
+    vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
+    if (va) {
+        volatile uint8_t *ec = (volatile uint8_t *)va;
+        ec[0x04] = 0x01; // keep OS handshake alive
+        ec[0x18] = 0x00; // kill 100% full fan blast
+        ec[0x17] = 0x00;
+
+        uint8_t cput = ec[0x70];
+        uint8_t target_fan = 1;
+
+        if (gFirebatFanMode >= 10 && gFirebatFanMode <= 16) {
+            target_fan = (uint8_t)(gFirebatFanMode - 10);
+        } else if (gFirebatFanMode == 1) { // Turbo
+            target_fan = (cput > 85) ? 6 : (cput > 75) ? 5 : (cput > 65) ? 4 : 3;
+        } else if (gFirebatFanMode == 0) { // Balanced
+            target_fan = (cput > 88) ? 6 : (cput > 80) ? 5 : (cput > 70) ? 3 : 2;
+        } else { // Quiet (2) / Office (3)
+            // Zero-RPM silent curve up to 65°C
+            if (cput < 65) target_fan = 0;
+            else if (cput < 75) target_fan = 1;
+            else if (cput < 85) target_fan = 2;
+            else if (cput < 92) target_fan = 3;
+            else if (cput < 96) target_fan = 5;
+            else target_fan = 6; // safety emergency
+        }
+
+        if (ec[0x74] != target_fan) ec[0x74] = target_fan;
+        if (ec[0x76] != target_fan) ec[0x76] = target_fan;
+    }
+
+    if (me->fFanCall) {
+        uint64_t when = 0;
+        clock_interval_to_deadline(1000, kMillisecondScale, &when);
+        thread_call_enter_delayed(me->fFanCall, when);
+    }
+}
+
+static int firebat_fan_mode_sysctl SYSCTL_HANDLER_ARGS
+{
+    vm_offset_t va = ml_io_map(0xFE0B0400, 0x100);
+    if (!va) return EIO;
+    volatile uint8_t *ec = (volatile uint8_t *)va;
+
+    int val = gFirebatFanMode;
+    IOLog("PhxAccel: Firebat diag: CPUT=%d C, Fan0=%d, Fan1=%d, FCMO=0x%02x, FCMI=0x%02x, FFFG=0x%02x, OSFG=0x%02x, FanMode=%d\n",
+          ec[0x70], ec[0x74], ec[0x76], ec[0x31], ec[0x32], ec[0x18], ec[0x04], gFirebatFanMode);
+
+    int err = sysctl_handle_int(oidp, &val, 0, req);
+    if (err == 0 && req->newptr != USER_ADDR_NULL) {
+        gFirebatFanMode = val;
+        ec[0x04] = 0x01; // OSFG = 1
+        ec[0x18] = 0x00; // FFFG = 0
+        ec[0x17] = 0x00; // FFLG = 0
+
+        if (val >= 10 && val <= 16) {
+            uint8_t target_fan = (uint8_t)(val - 10);
+            ec[0x74] = target_fan;
+            ec[0x76] = target_fan;
+            IOLog("PhxAccel: Firebat manual fan set: Fan0=%d, Fan1=%d\n", ec[0x74], ec[0x76]);
+        } else {
+            uint8_t target = 0x82;
+            if (val == 0) target = 0x80;       // Balanced
+            else if (val == 1) target = 0x81;  // Turbo
+            else if (val == 2) target = 0x82;  // Quiet
+            else if (val == 3) target = 0x83;  // Office
+            else target = (uint8_t)val;
+
+            ec[0x32] = target; // write FCMI
+            if (val == 2 || val == 3) {
+                ec[0x74] = 1;
+                ec[0x76] = 1;
+            }
+            IOLog("PhxAccel: Firebat EC fan mode set FCMI=0x%02x (FCMO=0x%02x, Fan0=%d, Fan1=%d)\n",
+                  target, ec[0x31], ec[0x74], ec[0x76]);
+        }
+    }
+    return err;
+}
+SYSCTL_PROC(_debug, OID_AUTO, firebat_fan_mode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN,
+            NULL, 0, firebat_fan_mode_sysctl, "I",
+            "Firebat U6C EC fan profile: 0=Balanced(0x80), 1=Turbo(0x81), 2=Quiet(0x82), 3=Office(0x83)");
 #define NVACCEL_CNT(nm, var, desc) SYSCTL_QUAD(_debug, OID_AUTO, nm, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&var, desc)
 NVACCEL_CNT(nvaccel_vm_alloc,         gCntVmAlloc,        "NVVidMemory::allocPhysical successes");
 NVACCEL_CNT(nvaccel_vm_alloc_bytes,   gCntVmAllocBytes,   "bytes of VRAM granted to NVVidMemory");
@@ -1428,7 +1563,7 @@ NVACCEL_CNT(nvaccel_iop_phase_us_sum, gIopPhaseUsSum,     "microseconds from the
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_vsync, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopVsync, 0, "1 = a copied frame completes on the next VBL tick (a flip's latch), 0 = at once");
 NVACCEL_CNT(nvaccel_iop_vsync_waits,  gCntIopVsyncWaits,  "completion checks answered 'not yet' (the frame waits for its tick)");
 NVACCEL_CNT(nvaccel_iop_vsync_late,   gCntIopVsyncLate,   "frames completed past two refreshes without a tick");
-static int    gIopFlip = 0;
+static int    gIopFlip = 1;
 static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
 NVACCEL_CNT(nvaccel_iop_flips,        gCntIopFlip,        "frames scanned out of the surface's own VRAM (zero copy)");
@@ -1604,6 +1739,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
+    sysctl_register_oid(&sysctl__debug_firebat_fan_mode);
     gSysctlInstalled = true;
     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
 #endif
@@ -2186,7 +2322,7 @@ static bool nvAccelIopAsyncStart(void *pipe, IOService *fb, unsigned head, IOSur
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe)
 {
     if (!gIopFlip || !fb || !s || head >= kNvMaxFB) return false;
-    // zero-copy scan-out is an NVIDIA display-engine flip; another vendor's panel (NMIntelFB) always takes the copy
+    // zero-copy scan-out is an NVIDIA display-engine flip; AMD APU uses high-speed SSE copy to BAR0 scanout
     if (!fb->metaCast("NVRMNVDAFramebuffer")) return false;
     NVAccel *a = NVAccel::gAccel;
     if (!a) return nvAccelIopFlipNo(1);
@@ -2208,12 +2344,13 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
         if (kmem) nvAccelIopCachePut(s, res, vm, kmem, bytes);
     }
     volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
-    const bool vramNewest = valid && (valid[6] & 1u);
+    const bool isPhx = fb->metaCast("PhxAMDFB") != nullptr;
+    const bool vramNewest = isPhx || (valid && (valid[6] & 1u));
     if (!kmem) return nvAccelIopFlipNo(4);
     if (!vramNewest) return nvAccelIopFlipNo(5);
     // Checked against the allocation this flip submits (vm, resolved above and cached), not re-resolved from the
     // resource: this runs outside the family lock, and the record must describe the VRAM that is about to be scanned.
-    if (!nvAccelIopVramFlippable(vramNewest, nvAccelPluginWrote(res->fPluginWroteCookie, vm->fAllocationCookie))) {
+    if (!isPhx && !nvAccelIopVramFlippable(vramNewest, nvAccelPluginWrote(res->fPluginWroteCookie, vm->fAllocationCookie))) {
         const SInt64 n = OSAddAtomic64(1, &gCntIopUnwritten);
         if (n < 4 || (n & 0xfff) == 0)
             ALOG("iop: surface 0x%x: VRAM marked newest but the plugin never wrote it -- copying its system memory instead of flipping (%lld so far)",
@@ -2265,7 +2402,8 @@ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
 }
 static void nvAccelIopHome(IOService *fb, unsigned head)
 {
-    if (!fb || head >= kNvMaxFB || !gIopFlipped[head] || !fb->metaCast("NVRMNVDAFramebuffer")) return;
+    if (!fb || head >= kNvMaxFB || !gIopFlipped[head]) return;
+    if (!fb->metaCast("NVRMNVDAFramebuffer") && !fb->metaCast("PhxAMDFB")) return;
     struct NVRMFlipRequest f; nvSVZero(&f, sizeof f);
     f.version = NVRM_FLIP_ABI_VERSION; f.flags = 1u;
     const OSSymbol *sym = OSSymbol::withCStringNoCopy("nvFlipToSurfacePure");

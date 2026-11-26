@@ -28,7 +28,7 @@ typedef struct _CAImageQueue *NVGLVBLQueueRef;
 struct nvglvbl_info { uint64_t host_time; double seconds; float rate; };
 enum { NVGLVBL_ENTRIES = 4 };   // as many as synchronize asks for (and the window server writes)
 #define NVGLVBL_MARKER "correctsVBlankWaitByDisplayPeriod"
-#define NVGLVBL_WINDOW_RECHECK_S 1.0   // a window's display is looked up again after this (it may have moved)
+#define NVGLVBL_WINDOW_RECHECK_S 30.0   // a window's display is looked up again after this (avoid IPC in render loop)
 enum { NVGLVBL_WINDOW_CACHE = 8 };      // windows whose display's period is remembered
 
 static struct {
@@ -107,11 +107,50 @@ static uint64_t nvglvbl_window_period(uint32_t window)
 static void nvglvbl_synchronize(id self, SEL cmd)
 {
     char *surface = (char *)(__bridge void *)self;
+    const uint32_t win = *(uint32_t *)(surface + gGLVBL.window_ivar);
+    uint64_t period = nvglvbl_window_period(win);
+    if (!period) period = nvglvbl_mach_from_seconds(1.0 / 60.0);
+
+    // Rate-limit unthrottled OpenGL render loops so games don't spin at hundreds of FPS burning CPU & power
+    static os_unfair_lock pace_lock = OS_UNFAIR_LOCK_INIT;
+    static struct { uint32_t window; uint64_t last_time; } pace_cache[NVGLVBL_WINDOW_CACHE];
+    if (period > 0) {
+        uint64_t now = mach_absolute_time();
+        os_unfair_lock_lock(&pace_lock);
+        int pslot = -1;
+        for (int i = 0; i < NVGLVBL_WINDOW_CACHE; i++) {
+            if (pace_cache[i].window == win) { pslot = i; break; }
+        }
+        if (pslot < 0) {
+            static unsigned pnext = 0;
+            pslot = (int)(pnext++ % NVGLVBL_WINDOW_CACHE);
+            pace_cache[pslot].window = win;
+            pace_cache[pslot].last_time = 0;
+        }
+        uint64_t target = pace_cache[pslot].last_time + period;
+        if (pace_cache[pslot].last_time && now < target) {
+            os_unfair_lock_unlock(&pace_lock);
+            mach_wait_until(target);
+            now = mach_absolute_time();
+            os_unfair_lock_lock(&pace_lock);
+        }
+        pace_cache[pslot].last_time = now;
+        os_unfair_lock_unlock(&pace_lock);
+    }
+
     NVGLVBLQueueRef queue = *(NVGLVBLQueueRef *)(surface + gGLVBL.queue_ivar);
     if (!queue || !gGLVBL.unconsumed(queue, 0, 0)) return;   // the window server has the previous frame: no wait
+
+    // Fast retry: WindowServer often completes consumer handoff within 100-500 us.
+    // Avoid dropping directly into a multi-millisecond quantum wait that halves FPS in 60 Hz locked games.
+    for (int retry = 0; retry < 4; retry++) {
+        struct timespec ts = { 0, 200000 };   // 200 us
+        nanosleep(&ts, NULL);
+        if (!gGLVBL.unconsumed(queue, 0, 0)) return;
+    }
+
     struct nvglvbl_info info[NVGLVBL_ENTRIES];
     const uint32_t n = gGLVBL.vbl_info(queue, info, NVGLVBL_ENTRIES);
-    const uint64_t period = nvglvbl_window_period(*(uint32_t *)(surface + gGLVBL.window_ivar));
     // the entries are the window server's vblank plus 1..n times the spacing CoreAnimation took for the period: with a
     // longer spacing than the display's period, the next vblank is that vblank plus a whole number of periods
     if (n >= 2 && n <= NVGLVBL_ENTRIES && period && info[1].host_time > info[0].host_time &&

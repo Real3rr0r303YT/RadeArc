@@ -13,10 +13,11 @@ read -r _ CHIP _ <<<"$(grep '^CHIP ' <<<"$PLAN")"
 echo "== chip $CHIP: $(grep '^CHIP ' <<<"$PLAN" | cut -d' ' -f3-)"
 read -r _ TOCF TOCOFF TOCLEN <<<"$(grep '^TOC ' <<<"$PLAN")"
 echo "== watchdog: reboot in 3 min unless cancelled =="
-$SUDO bash -c 'nohup shutdown -r +3 >/dev/null 2>&1 &'
-stop(){ echo "== $1: stopping, nothing more is sent"; $SUDO killall shutdown 2>/dev/null; exit 1; }
-P psp destroy >/dev/null 2>&1
-# phxctl always exits 0; the IOKit result is the "kr" it prints (PhxBringup refuses with 0xe00002c7 on a chip whose
+WATCHDOG_PID=$($SUDO bash -c 'nohup shutdown -r +3 </dev/null >/dev/null 2>&1 & echo $!')
+# nothing was sent that could hang the GPU: cancel this script's own watchdog only (not other shutdowns)
+stop(){ echo "== $1: stopping, nothing more is sent"; $SUDO /bin/kill "$WATCHDOG_PID" 2>/dev/null || true; exit 1; }
+P psp destroy >/dev/null 2>&1 || true
+# phxctl exits non-zero on an IOKit/PSP error since upstream 22efbe6; the IOKit result is the "kr" it prints (PhxBringup refuses with 0xe00002c7 on a chip whose
 # bring-up is not enabled, e.g. Phoenix 2 for now)
 P psp create 0x1100000 | grep -q 'kr 0x00000000' || stop "PSP ring not created"
 P stage "$TOCF" "$TOCOFF" "$TOCLEN" 0x0 >/dev/null
@@ -50,5 +51,6 @@ P smu 0x2 0 | tail -1
 P smu 0x16 1 | tail -1
 sleep 2
 P regs 0xee7e 0x21a0 0x2004 0x263e
-$SUDO killall shutdown 2>/dev/null; echo "watchdog cancelled rc=$?"
+$SUDO /bin/kill "$WATCHDOG_PID" 2>/dev/null || true
+echo "watchdog cancelled"
 exit 0
