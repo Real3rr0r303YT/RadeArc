@@ -62,6 +62,9 @@ static Fake &freshGop() {
     f.reg[phxdmubinbox::kInbox1Size.addr] = 8192;
     f.reg[phxdmubinbox::kCw4Offset.addr] = 0x0d0f9900; f.reg[phxdmubinbox::kCw4OffsetHigh.addr] = 0x80;
     f.reg[phxdmubinbox::kInbox1Wptr.addr] = f.reg[phxdmubinbox::kInbox1Rptr.addr] = 128;
+    // the driver's DMCUB firmware running (Test J): modeset() refuses to take the stream down without it (upstream 7d2b799)
+    f.reg[kDmcubEnable.addr] |= kDmcubEnable.mask;
+    f.reg[kDmcubScratch0.addr] = phxdmubinbox::kBootDalFw | phxdmubinbox::kBootMailboxRdy;
     return f;
 }
 
