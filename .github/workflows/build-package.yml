@@ -140,6 +140,18 @@ jobs:
         path: ${{ runner.temp }}/out/
         retention-days: 30
 
+    # the folder artifact above loses file modes and symlinks; this one is the same zip the release gets
+    - name: Zip the package (modes + symlinks kept)
+      if: steps.gate.outputs.skip != '1'
+      run: cd "$RUNNER_TEMP/out" && zip -qry "$RUNNER_TEMP/radearc-package.zip" radearc-package
+    - uses: actions/upload-artifact@v4
+      if: steps.gate.outputs.skip != '1'
+      with:
+        name: radearc-package-zip
+        path: ${{ runner.temp }}/radearc-package.zip
+        compression-level: 0
+        retention-days: 30
+
     # update.sh downloads from here: https://github.com/<repo>/releases/download/package-latest/radearc-package.zip
     # (a release, unlike an Actions artifact, downloads without a GitHub login)
     # only main publishes; a package built on another branch stays an Actions artifact
