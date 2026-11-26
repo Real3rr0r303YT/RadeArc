@@ -53,12 +53,17 @@ struct PhxBringup {
     bool vmFlushTlb(unsigned) { assert(gpuLock->held); tlbs++; return flushOk; }
     bool gpuReady() { return true; }
     IOReturn vmUnmap(uint32_t, uint64_t, uint64_t);
-    IOReturn vmMap(uint32_t, uint64_t, IOMemoryDescriptor *, uint64_t, uint64_t);
+    IOReturn vmMap(uint32_t, uint64_t, IOMemoryDescriptor *, uint64_t, uint64_t, bool writable=true);
 };
 struct IOExternalMethodArguments { void *structureInput; };
+// RadeArc's BO diagnostics (debug.phxbo_*)
+unsigned gBoMapsFull, gVmMapFail, gBoPeakMaps;
+void OSIncrementAtomic(unsigned *p) { (*p)++; }
+void notePeak(unsigned *peak, unsigned v) { if (v > *peak) *peak = v; }
 bool shape(IOExternalMethodArguments *, unsigned, unsigned, unsigned, unsigned) { return true; }
 struct IOAccelPhxNativeClient {
-    struct Bo { uint64_t size=8192; IOMemoryDescriptor *md; } bo;
+    struct Bo { uint64_t size=8192; IOMemoryDescriptor *md; bool readOnly=false; } bo;
+    unsigned mapsUsed=0;
     struct Map {
         bool used; uint32_t handle; uint64_t va,size,off; uint32_t flags;
     } maps[1]{};

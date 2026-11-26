@@ -34,6 +34,8 @@ void thread_call_free(void *) { callFrees++; }
 int gSysctlUp=0;
 int sysctl__debug_phxbos_flush, sysctl__debug_phxbos_flush_bytes;
 int sysctl__debug_phx_hang_ms, sysctl__debug_phx_hang_kills;
+// RadeArc's BO diagnostics (debug.phxbo_*)
+int sysctl__debug_phxbo_clients, sysctl__debug_phxbo_handles_full, sysctl__debug_phxbo_host_cap_mb, sysctl__debug_phxbo_host_mb, sysctl__debug_phxbo_host_mb_peak, sysctl__debug_phxbo_host_nomem, sysctl__debug_phxbo_host_readonly, sysctl__debug_phxbo_host_ro, sysctl__debug_phxbo_host_wire_err, sysctl__debug_phxbo_host_wire_err_ro, sysctl__debug_phxbo_host_wire_fail, sysctl__debug_phxbo_maps_full, sysctl__debug_phxbo_nomem, sysctl__debug_phxbo_peak_handles, sysctl__debug_phxbo_peak_maps, sysctl__debug_phxbo_task_alloc, sysctl__debug_phxbo_task_alloc_fail, sysctl__debug_phxbo_vmmap_fail;
 void sysctl_unregister_oid(int *) {}
 template<class... T> void IOLog(const char *, T...) {}
 struct IOService { unsigned superStops=0; void stop(IOService *) { superStops++; } };

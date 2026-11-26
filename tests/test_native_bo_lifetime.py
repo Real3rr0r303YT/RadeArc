@@ -45,7 +45,7 @@ struct IOAccelPhxNativeClient {
     struct Map { bool used=true; uint32_t handle=1; uint64_t va=4096, size=4096; } maps[1];
     Owner *owner;
     uint64_t lastSeq=7, hostUsed=8, gttUsed=8, hiUsed=8, visUsed=8;
-    uint32_t vmid=1;
+    uint32_t vmid=1, mapsUsed=1;
     unsigned releases=0, fences=0;
     Bo *findBo(uint32_t h) { return h==1 && bo.live ? &bo : nullptr; }
     void boRelease(Bo &b) { releases++; b.live=false; }
